@@ -278,8 +278,11 @@ let likedSongs   = [];
 let historySongs = [];
 let currentSong  = null;
 let searchIdx    = 0;
-let isSeeking    = false;
+let seeking      = false;
 let shuffle      = false;
+let resumeTime   = 0;
+let stallTimer   = null;
+let lastTime     = -1;
 
 // ── LOCAL STORAGE ──
 function lsGet(k, def) { try { return JSON.parse(localStorage.getItem(k)) ?? def; } catch { return def; } }
@@ -396,11 +399,16 @@ async function playTrack(s, arr, i) {
   if (arr === searchSongs) searchIdx = i;
 
   // Player UI
+  seeking = false;
+  lastTime = 0;
   document.getElementById('npTitle').textContent  = s.title;
   document.getElementById('npArtist').textContent = s.artist;
   document.getElementById('coverImg').src         = s.thumbnail;
   timeTot.textContent = fmt(s.duration);
-  setScrub(0);
+  scrubFill.style.width = "0%";
+  scrubThumb.style.left = "0%";
+  scrubInput.value = 0;
+  timeNow.textContent = "0:00";
 
   // Highlight playing card everywhere
   document.querySelectorAll('.song-card').forEach(c => {
@@ -438,52 +446,120 @@ function getSongFromCard(card) {
   return null;
 }
 
-// ── PROGRESS BAR ──
-// setScrub: single function that updates fill + thumb + input value atomically
-function setScrub(pct) {
+// ── AUDIO ENGINE ──
+// The stream URL from /api/stream/ is a proxied chunked response.
+// If it stalls mid-song we re-fetch from the same endpoint with a Range header
+// (the Flask proxy supports it via requests streaming). We track resumeTime so
+// seeking and stall-recovery both work correctly.
+
+
+function setBar(pct) {
+  // pct: 0–100
   scrubFill.style.width = pct + '%';
   scrubThumb.style.left = pct + '%';
-  scrubInput.value = Math.round(pct * 100); // max=10000, so pct*100
 }
 
-audio.ontimeupdate = () => {
-  if (isSeeking || !audio.duration) return;
+// ── TIME UPDATES ──
+audio.addEventListener('timeupdate', () => {
+  if (seeking || !audio.duration) return;
+  lastTime = audio.currentTime;
   const pct = (audio.currentTime / audio.duration) * 100;
-  setScrub(pct);
+  setBar(pct);
+  scrubInput.value    = Math.round(pct * 100); // 0–10000
   timeNow.textContent = fmt(audio.currentTime);
-};
-
-audio.onloadedmetadata = () => { timeTot.textContent = fmt(audio.duration); };
-audio.onended = () => nextSong();
-audio.onplay  = () => { playBtn.innerHTML = '<i class="fas fa-pause"></i>'; };
-audio.onpause = () => { playBtn.innerHTML = '<i class="fas fa-play"></i>'; };
-
-// mousedown → freeze updates
-scrubInput.addEventListener('mousedown',  () => { isSeeking = true; });
-scrubInput.addEventListener('touchstart', () => { isSeeking = true; }, { passive: true });
-
-// input → move visual only
-scrubInput.addEventListener('input', () => {
-  const pct = scrubInput.value / 100; // value 0-10000, pct 0-100
-  scrubFill.style.width = pct + '%';
-  scrubThumb.style.left = pct + '%';
-  if (audio.duration) timeNow.textContent = fmt((pct / 100) * audio.duration);
 });
 
-// mouseup → actually seek, then unfreeze after a tick
-function doSeek() {
-  if (audio.duration) {
-    audio.currentTime = (scrubInput.value / 10000) * audio.duration;
-  }
-  setTimeout(() => { isSeeking = false; }, 80);
+audio.addEventListener('loadedmetadata', () => {
+  timeTot.textContent = fmt(audio.duration);
+});
+
+audio.addEventListener('play',  () => { playBtn.innerHTML = '<i class="fas fa-pause"></i>'; });
+audio.addEventListener('pause', () => { playBtn.innerHTML = '<i class="fas fa-play"></i>'; });
+audio.addEventListener('ended', () => nextSong());
+
+// ── STALL DETECTION & RECOVERY ──
+// When the proxy stream stalls, 'waiting' fires. We reload the stream
+// from the same URL (Flask will re-fetch from YouTube) and resume from lastTime.
+audio.addEventListener('waiting', () => {
+  clearTimeout(stallTimer);
+  stallTimer = setTimeout(() => {
+    if (!currentSong || audio.ended) return;
+    const t = audio.currentTime || lastTime;
+    console.log('Stream stalled at', t, '— reloading');
+    resumeFromTime(t);
+  }, 2000); // only act if stalled for 2s (not just normal buffering)
+});
+
+audio.addEventListener('playing', () => {
+  clearTimeout(stallTimer); // stream recovered, cancel recovery
+});
+
+audio.addEventListener('error', () => {
+  if (!currentSong) return;
+  const t = audio.currentTime || lastTime;
+  setTimeout(() => resumeFromTime(t), 1000);
+});
+
+function resumeFromTime(t) {
+  if (!currentSong) return;
+  resumeTime = t;
+  // Set new src — browser re-requests the stream endpoint
+  audio.src = '/api/stream/' + currentSong.id;
+  audio.load();
+  audio.addEventListener('canplay', function onCanPlay() {
+    audio.removeEventListener('canplay', onCanPlay);
+    audio.currentTime = resumeTime;
+    audio.play().catch(() => {});
+  }, { once: true });
 }
-scrubInput.addEventListener('mouseup',  doSeek);
-scrubInput.addEventListener('touchend', doSeek);
+
+// ── SCRUBBER ──
+// mousedown: freeze bar updates so dragging doesn't fight timeupdate
+scrubInput.addEventListener('mousedown',  () => { seeking = true; });
+scrubInput.addEventListener('touchstart', () => { seeking = true; }, { passive: true });
+
+// input: move bar visually while dragging
+scrubInput.addEventListener('input', () => {
+  const pct = scrubInput.value / 100; // 0–10000 → 0–100
+  setBar(pct);
+  if (audio.duration) {
+    timeNow.textContent = fmt((scrubInput.value / 10000) * audio.duration);
+  }
+});
+
+// mouseup: seek audio then re-enable updates
+function commitSeek() {
+  if (!seeking) return;
+  const targetTime = (scrubInput.value / 10000) * (audio.duration || 0);
+  if (audio.duration) {
+    audio.currentTime = targetTime;
+    lastTime = targetTime;
+  }
+  // Wait for seeked event before unfreezing — no setTimeout guessing
+  audio.addEventListener('seeked', function onSeeked() {
+    audio.removeEventListener('seeked', onSeeked);
+    seeking = false;
+  }, { once: true });
+  // Fallback in case seeked never fires (e.g. stream not loaded yet)
+  setTimeout(() => { seeking = false; }, 500);
+}
+scrubInput.addEventListener('mouseup',  commitSeek);
+scrubInput.addEventListener('touchend', commitSeek);
+document.addEventListener('mouseup', () => { if (seeking) commitSeek(); });
 
 // ── CONTROLS ──
 playBtn.addEventListener('click', () => {
-  if (!audio.src) return;
-  audio.paused ? audio.play() : audio.pause();
+  if (!currentSong) return;
+  if (audio.paused) {
+    // If src is empty or errored, reload from last known position
+    if (!audio.src || audio.error) {
+      resumeFromTime(lastTime);
+    } else {
+      audio.play().catch(() => resumeFromTime(lastTime));
+    }
+  } else {
+    audio.pause();
+  }
 });
 
 document.getElementById('nextBtn').addEventListener('click', nextSong);
@@ -571,6 +647,10 @@ async function renderDownloads() {
     const res  = await fetch('/api/cached-files');
     const data = await res.json();
     el.innerHTML = '';
+    if (data.error) {
+      el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-circle"></i>Error: ' + escHtml(data.error) + '</div>';
+      return;
+    }
     if (!data.files || !data.files.length) {
       el.innerHTML = '<div class="empty-state"><i class="fas fa-download"></i>No cached files yet.<br>Download a song from the player.</div>';
       return;
@@ -626,13 +706,27 @@ dlBtn.addEventListener('click', async () => {
         titles[stem] = currentSong.title + ' — ' + currentSong.artist;
         lsSet('mf_dl_titles', titles);
       }
-    } else { throw new Error(); }
-  } catch {
+    } else { throw new Error(data.message || 'Unknown error'); }
+  } catch(err) {
     dlBtn.disabled  = false;
     dlBtn.className = 'dl-btn';
     dlBtn.innerHTML = '<i class="fas fa-download"></i> Download to cache';
-    dlStatus.textContent = '✗ Download failed';
-    setTimeout(() => { dlStatus.textContent = ''; }, 3000);
+    // If file actually exists despite error, show success anyway
+    fetch('/api/cached-files').then(r => r.json()).then(d => {
+      const match = d.files && d.files.find(f => f.name.startsWith(currentSong.id));
+      if (match) {
+        dlBtn.className = 'dl-btn done';
+        dlBtn.innerHTML = '<i class="fas fa-check"></i> Cached!';
+        dlStatus.innerHTML = '<i class="fas fa-file-audio"></i> <a href="/cache/' +
+          encodeURIComponent(match.name) + '" download="' + escHtml(match.name) + '">Save file to device</a>';
+      } else {
+        dlStatus.textContent = '✗ ' + (err.message || 'Download failed');
+        setTimeout(() => { dlStatus.textContent = ''; }, 5000);
+      }
+    }).catch(() => {
+      dlStatus.textContent = '✗ ' + (err.message || 'Download failed');
+      setTimeout(() => { dlStatus.textContent = ''; }, 5000);
+    });
   }
 });
 

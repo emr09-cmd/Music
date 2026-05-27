@@ -139,6 +139,9 @@ def stream_audio(video_id):
 @app.route('/api/download/<video_id>')
 def download_to_cache(video_id):
     try:
+        # Snapshot files before download so we can detect what was created
+        before = set(os.listdir(DOWNLOAD_FOLDER))
+
         ydl_opts = {
             'format': 'bestaudio/best',
             'quiet': True,
@@ -149,15 +152,21 @@ def download_to_cache(video_id):
             info = ydl.extract_info(f"https://youtube.com/watch?v={video_id}", download=True)
             title = info.get('title', video_id)
 
-        # Find the actual saved file (extension may differ from prediction)
+        after = set(os.listdir(DOWNLOAD_FOLDER))
+        new_files = [f for f in (after - before) if not f.startswith('.')]
+
+        # Prefer newly created file; fallback to any file matching video_id stem
         saved = None
-        for f in Path(DOWNLOAD_FOLDER).iterdir():
-            if f.stem == video_id and f.is_file():
-                saved = f.name
-                break
+        if new_files:
+            saved = new_files[0]
+        else:
+            for f in os.listdir(DOWNLOAD_FOLDER):
+                if f.startswith(video_id) and not f.startswith('.'):
+                    saved = f
+                    break
 
         if not saved:
-            return jsonify({"status": "error", "message": "File not found after download"}), 500
+            return jsonify({"status": "error", "message": "Downloaded but file not found — check downloads folder"}), 500
 
         return jsonify({
             "status": "success",
@@ -176,15 +185,22 @@ def serve_cache(filename):
 @app.route('/api/cached-files')
 def cached_files():
     if 'user' not in session:
-        return jsonify({'files': []})
+        return jsonify({'files': [], 'error': 'not logged in'})
     try:
-        files = []
-        for f in sorted(Path(DOWNLOAD_FOLDER).iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-            if f.is_file() and not f.name.startswith('.'):
-                files.append({'name': f.name, 'size': f.stat().st_size})
-        return jsonify({'files': files})
-    except Exception:
-        return jsonify({'files': []})
+        os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+        entries = []
+        for name in os.listdir(DOWNLOAD_FOLDER):
+            if name.startswith('.'):
+                continue
+            full = os.path.join(DOWNLOAD_FOLDER, name)
+            if os.path.isfile(full):
+                entries.append({'name': name, 'size': os.path.getsize(full), 'mtime': os.path.getmtime(full)})
+        entries.sort(key=lambda x: x['mtime'], reverse=True)
+        for e in entries:
+            del e['mtime']
+        return jsonify({'files': entries})
+    except Exception as e:
+        return jsonify({'files': [], 'error': str(e)})
 
 if __name__ == '__main__':
     app.run(debug=True)
