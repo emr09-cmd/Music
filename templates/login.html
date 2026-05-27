@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login — MeloFree</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="auth-page">
+  <div class="auth-wrap">
+    <div class="auth-card">
+      <div class="auth-logo">Melo<span>Free</span></div>
+      <h1 class="auth-title">Welcome back</h1>
+      <p class="auth-sub">Sign in to continue listening</p>
+
+      {% if error %}
+      <div class="auth-error">{{ error }}</div>
+      {% endif %}
+
+      <form method="POST" class="auth-form">
+        <div class="field-group">
+          <label for="username">Username</label>
+          <input type="text" id="username" name="username" placeholder="your_username" required autocomplete="username">
+        </div>
+        <div class="field-group">
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password" placeholder="••••••••" required autocomplete="current-password">
+        </div>
+        <button type="submit" class="auth-btn">Sign in</button>
+      </form>
+
+      <p class="auth-footer">
+        Don't have an account?
+        <a href="/register">Create one</a>
+      </p>
+    </div>
+  </div>
+</body>
+</html>
