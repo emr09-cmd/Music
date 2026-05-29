@@ -125,16 +125,31 @@ def stream_audio(video_id):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"https://youtube.com/watch?v={video_id}", download=False)
             audio_url = info['url']
+            ext = info.get('ext', 'mp4')
+
+        range_header = request.headers.get('Range')
+        req_headers = {'Range': range_header} if range_header else {}
+
+        r = requests.get(audio_url, headers=req_headers, stream=True)
+        status = r.status_code  # 200 or 206 partial
+
+        resp_headers = {
+            'Content-Type': r.headers.get('Content-Type', f'audio/{ext}'),
+            'Accept-Ranges': 'bytes',
+        }
+        if 'Content-Length' in r.headers:
+            resp_headers['Content-Length'] = r.headers['Content-Length']
+        if 'Content-Range' in r.headers:
+            resp_headers['Content-Range'] = r.headers['Content-Range']
 
         def generate():
-            with requests.get(audio_url, stream=True) as r:
-                for chunk in r.iter_content(chunk_size=128 * 1024):
-                    if chunk:
-                        yield chunk
+            for chunk in r.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
 
-        return Response(generate(), mimetype='audio/mp4')
-    except Exception:
-        return "Stream error", 500
+        return Response(generate(), status=status, headers=resp_headers)
+    except Exception as e:
+        return str(e), 500
 
 @app.route('/api/download/<video_id>')
 def download_to_cache(video_id):

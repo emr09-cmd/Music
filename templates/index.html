@@ -271,8 +271,6 @@ const dlStatus    = document.getElementById('dlStatus');
 const lyricsBox   = document.getElementById('lyricsBox');
 
 // ── STATE ──
-// searchSongs / likedSongs / historySongs are separate arrays so
-// we never pass objects through HTML onclick attributes (that was the bug).
 let searchSongs  = [];
 let likedSongs   = [];
 let historySongs = [];
@@ -280,27 +278,33 @@ let currentSong  = null;
 let searchIdx    = 0;
 let seeking      = false;
 let shuffle      = false;
-let resumeTime   = 0;
 let stallTimer   = null;
-let lastTime     = -1;
+let lastTime     = 0;
+let cachedSrc    = '';
 
 // ── LOCAL STORAGE ──
 function lsGet(k, def) { try { return JSON.parse(localStorage.getItem(k)) ?? def; } catch { return def; } }
 function lsSet(k, v)   { localStorage.setItem(k, JSON.stringify(v)); }
-
-function loadLiked()   { likedSongs = lsGet('mf_liked_songs', []); }
+function loadLiked()   { likedSongs   = lsGet('mf_liked_songs', []); }
 function saveLiked()   { lsSet('mf_liked_songs', likedSongs); }
 function loadHistory() { historySongs = lsGet('mf_history', []); }
 function saveHistory() { lsSet('mf_history', historySongs); }
-
 loadLiked();
 loadHistory();
 
-// ── FORMAT TIME ──
+// ── UTILS ──
 function fmt(s) {
   if (!s || isNaN(s)) return '0:00';
   return Math.floor(s/60) + ':' + String(Math.floor(s%60)).padStart(2,'0');
 }
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmtSize(b) {
+  if (!b) return '';
+  return b > 1048576 ? (b/1048576).toFixed(1)+' MB' : (b/1024).toFixed(0)+' KB';
+}
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 
 // ── NAVIGATION ──
 document.querySelectorAll('.nav-item[data-view]').forEach(el => {
@@ -311,66 +315,17 @@ document.querySelectorAll('.nav-item[data-view]').forEach(el => {
     document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
     document.getElementById('view-' + view).classList.add('active');
     document.getElementById('searchWrap').style.display = view === 'music' ? '' : 'none';
-    // show toggle bar on all song views, hide on downloads
     const showToggle = view !== 'downloads';
     document.getElementById('thumbToggleBar').style.display = showToggle ? '' : 'none';
-    document.getElementById('hiddenBanner').style.display = (showToggle && document.body.classList.contains('no-thumbs')) ? '' : 'none';
+    document.getElementById('hiddenBanner').style.display =
+      (showToggle && document.body.classList.contains('no-thumbs')) ? '' : 'none';
     if (view === 'liked')     renderLiked();
     if (view === 'history')   renderHistory();
     if (view === 'downloads') renderDownloads();
   });
 });
 
-// ── BUILD SONG CARD (no onclick in HTML — uses data-* + event delegation) ──
-function buildCard(s, i, ns) {
-  const liked = likedSongs.some(x => x.id === s.id);
-  const div = document.createElement('div');
-  div.className = 'song-card';
-  div.dataset.ns = ns;
-  div.dataset.i  = i;
-  if (currentSong && currentSong.id === s.id) div.classList.add('playing');
-  div.innerHTML =
-    '<div class="song-thumb">' +
-      '<img src="' + s.thumbnail + '" alt="" loading="lazy">' +
-      '<div class="thumb-play"><i class="fas fa-play"></i></div>' +
-    '</div>' +
-    '<div class="song-info">' +
-      '<div class="song-title">' + escHtml(s.title) + '</div>' +
-      '<div class="song-artist">' + escHtml(s.artist) + '</div>' +
-    '</div>' +
-    '<div class="song-actions">' +
-      '<span class="song-duration">' + fmt(s.duration) + '</span>' +
-      '<button class="icon-btn like-btn' + (liked ? ' liked' : '') + '" data-id="' + s.id + '" title="Like">' +
-        '<i class="fas fa-heart"></i>' +
-      '</button>' +
-    '</div>';
-  return div;
-}
-
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-// Delegate clicks on any list container
-function attachClicks(container, getArr) {
-  container.addEventListener('click', e => {
-    const likeBtn = e.target.closest('.like-btn');
-    if (likeBtn) { e.stopPropagation(); toggleLikeById(likeBtn.dataset.id); return; }
-    const card = e.target.closest('.song-card');
-    if (!card) return;
-    const arr = getArr();
-    const i   = parseInt(card.dataset.i, 10);
-    if (arr[i]) playTrack(arr[i], arr, i);
-  });
-}
-
-attachClicks(document.getElementById('songList'),    () => searchSongs);
-attachClicks(document.getElementById('likedList'),   () => likedSongs);
-attachClicks(document.getElementById('historyList'), () => historySongs);
-
 // ── SEARCH ──
-function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
-
 document.getElementById('searchInput').addEventListener('input', debounce(async () => {
   const q = document.getElementById('searchInput').value.trim();
   if (q.length < 2) return;
@@ -393,79 +348,123 @@ function renderSearch() {
   searchSongs.forEach((s, i) => list.appendChild(buildCard(s, i, 'search')));
 }
 
-// ── PLAY ──
+// ── CARD BUILDER ──
+function buildCard(s, i, ns) {
+  const liked = likedSongs.some(x => x.id === s.id);
+  const isPlaying = currentSong && currentSong.id === s.id && !cachedSrc;
+  const div = document.createElement('div');
+  div.className = 'song-card' + (isPlaying ? ' playing' : '');
+  div.dataset.ns = ns;
+  div.dataset.i  = i;
+  div.innerHTML =
+    '<div class="song-thumb">' +
+      '<img src="' + s.thumbnail + '" alt="" loading="lazy">' +
+      '<div class="thumb-play"><i class="fas fa-play"></i></div>' +
+    '</div>' +
+    '<div class="song-info">' +
+      '<div class="song-title">' + escHtml(s.title) + '</div>' +
+      '<div class="song-artist">' + escHtml(s.artist) + '</div>' +
+    '</div>' +
+    '<div class="song-actions">' +
+      '<span class="song-duration">' + fmt(s.duration) + '</span>' +
+      '<button class="icon-btn like-btn' + (liked ? ' liked' : '') + '" data-id="' + s.id + '">' +
+        '<i class="fas fa-heart"></i>' +
+      '</button>' +
+    '</div>';
+  return div;
+}
+
+// ── EVENT DELEGATION ──
+function attachClicks(container, getArr) {
+  container.addEventListener('click', e => {
+    const likeBtn = e.target.closest('.like-btn');
+    if (likeBtn) { e.stopPropagation(); toggleLikeById(likeBtn.dataset.id); return; }
+    const card = e.target.closest('.song-card');
+    if (!card) return;
+    const arr = getArr();
+    const i = parseInt(card.dataset.i, 10);
+    if (arr[i]) playTrack(arr[i], arr, i);
+  });
+}
+attachClicks(document.getElementById('songList'),    () => searchSongs);
+attachClicks(document.getElementById('likedList'),   () => likedSongs);
+attachClicks(document.getElementById('historyList'), () => historySongs);
+
+// ── PLAY FROM STREAM ──
 async function playTrack(s, arr, i) {
   currentSong = s;
+  cachedSrc   = '';
   if (arr === searchSongs) searchIdx = i;
 
-  // Player UI
-  seeking = false;
-  lastTime = 0;
   document.getElementById('npTitle').textContent  = s.title;
   document.getElementById('npArtist').textContent = s.artist;
   document.getElementById('coverImg').src         = s.thumbnail;
   timeTot.textContent = fmt(s.duration);
-  scrubFill.style.width = "0%";
-  scrubThumb.style.left = "0%";
-  scrubInput.value = 0;
-  timeNow.textContent = "0:00";
 
-  // Highlight playing card everywhere
+  seeking = false;
+  lastTime = 0;
+  setBar(0);
+  scrubInput.value    = 0;
+  timeNow.textContent = '0:00';
+
   document.querySelectorAll('.song-card').forEach(c => {
-    c.classList.toggle('playing', c.dataset.ns && getSongFromCard(c) && getSongFromCard(c).id === s.id);
+    const ns = c.dataset.ns, idx2 = parseInt(c.dataset.i, 10);
+    const arr2 = ns === 'search' ? searchSongs : ns === 'liked' ? likedSongs : historySongs;
+    c.classList.toggle('playing', arr2[idx2] && arr2[idx2].id === s.id);
   });
 
-  // Heart
   updateHeart();
 
-  // Reset download
   dlBtn.disabled  = false;
   dlBtn.className = 'dl-btn';
   dlBtn.innerHTML = '<i class="fas fa-download"></i> Download to cache';
   dlStatus.innerHTML = '';
 
-  // Stream
-  audio.src = '/api/stream/' + s.id;
+  const src = '/api/stream/' + s.id;
+  audio.src = src;
   try { await audio.play(); } catch(e) {}
 
-  // History
   historySongs = historySongs.filter(x => x.id !== s.id);
   historySongs.unshift(s);
   if (historySongs.length > 50) historySongs.length = 50;
   saveHistory();
-
   loadLyrics(s.title, s.artist, s.duration);
 }
 
-function getSongFromCard(card) {
-  const ns = card.dataset.ns;
-  const i  = parseInt(card.dataset.i, 10);
-  if (ns === 'search')  return searchSongs[i];
-  if (ns === 'liked')   return likedSongs[i];
-  if (ns === 'history') return historySongs[i];
-  return null;
+// ── PLAY FROM CACHE ──
+async function playFromCache(filename, displayName) {
+  cachedSrc = '/cache/' + encodeURIComponent(filename);
+
+  document.getElementById('npTitle').textContent  = displayName;
+  document.getElementById('npArtist').textContent = 'Cached file';
+  document.getElementById('coverImg').src         = 'https://picsum.photos/seed/' + filename + '/300/300';
+  timeTot.textContent = '—';
+
+  seeking = false;
+  lastTime = 0;
+  setBar(0);
+  scrubInput.value    = 0;
+  timeNow.textContent = '0:00';
+
+  document.querySelectorAll('.song-card').forEach(c => c.classList.remove('playing'));
+
+  audio.src = cachedSrc;
+  try { await audio.play(); } catch(e) {}
 }
 
 // ── AUDIO ENGINE ──
-// The stream URL from /api/stream/ is a proxied chunked response.
-// If it stalls mid-song we re-fetch from the same endpoint with a Range header
-// (the Flask proxy supports it via requests streaming). We track resumeTime so
-// seeking and stall-recovery both work correctly.
-
-
 function setBar(pct) {
-  // pct: 0–100
+  pct = Math.max(0, Math.min(100, pct));
   scrubFill.style.width = pct + '%';
   scrubThumb.style.left = pct + '%';
 }
 
-// ── TIME UPDATES ──
 audio.addEventListener('timeupdate', () => {
   if (seeking || !audio.duration) return;
   lastTime = audio.currentTime;
   const pct = (audio.currentTime / audio.duration) * 100;
   setBar(pct);
-  scrubInput.value    = Math.round(pct * 100); // 0–10000
+  scrubInput.value    = Math.round(pct * 100);
   timeNow.textContent = fmt(audio.currentTime);
 });
 
@@ -477,89 +476,78 @@ audio.addEventListener('play',  () => { playBtn.innerHTML = '<i class="fas fa-pa
 audio.addEventListener('pause', () => { playBtn.innerHTML = '<i class="fas fa-play"></i>'; });
 audio.addEventListener('ended', () => nextSong());
 
-// ── STALL DETECTION & RECOVERY ──
-// When the proxy stream stalls, 'waiting' fires. We reload the stream
-// from the same URL (Flask will re-fetch from YouTube) and resume from lastTime.
+// Stall recovery — stream only, not cached files
 audio.addEventListener('waiting', () => {
+  if (cachedSrc) return;
   clearTimeout(stallTimer);
   stallTimer = setTimeout(() => {
     if (!currentSong || audio.ended) return;
-    const t = audio.currentTime || lastTime;
-    console.log('Stream stalled at', t, '— reloading');
-    resumeFromTime(t);
-  }, 2000); // only act if stalled for 2s (not just normal buffering)
+    const t = lastTime;
+    console.log('Stream stalled at', fmt(t), '— reloading');
+    const src = '/api/stream/' + currentSong.id;
+    audio.src = src;
+    audio.load();
+    audio.addEventListener('canplay', () => {
+      audio.currentTime = t;
+      audio.play().catch(() => {});
+    }, { once: true });
+  }, 3000);
+});
+audio.addEventListener('playing', () => { clearTimeout(stallTimer); });
+audio.addEventListener('error',   () => {
+  clearTimeout(stallTimer);
+  if (cachedSrc || !currentSong) return;
+  setTimeout(() => {
+    const t = lastTime;
+    audio.src = '/api/stream/' + currentSong.id;
+    audio.load();
+    audio.addEventListener('canplay', () => {
+      audio.currentTime = t;
+      audio.play().catch(() => {});
+    }, { once: true });
+  }, 1500);
 });
 
-audio.addEventListener('playing', () => {
-  clearTimeout(stallTimer); // stream recovered, cancel recovery
-});
-
-audio.addEventListener('error', () => {
-  if (!currentSong) return;
-  const t = audio.currentTime || lastTime;
-  setTimeout(() => resumeFromTime(t), 1000);
-});
-
-function resumeFromTime(t) {
-  if (!currentSong) return;
-  resumeTime = t;
-  // Set new src — browser re-requests the stream endpoint
-  audio.src = '/api/stream/' + currentSong.id;
-  audio.load();
-  audio.addEventListener('canplay', function onCanPlay() {
-    audio.removeEventListener('canplay', onCanPlay);
-    audio.currentTime = resumeTime;
-    audio.play().catch(() => {});
-  }, { once: true });
-}
-
-// ── SCRUBBER ──
-// mousedown: freeze bar updates so dragging doesn't fight timeupdate
-scrubInput.addEventListener('mousedown',  () => { seeking = true; });
-scrubInput.addEventListener('touchstart', () => { seeking = true; }, { passive: true });
-
-// input: move bar visually while dragging
-scrubInput.addEventListener('input', () => {
-  const pct = scrubInput.value / 100; // 0–10000 → 0–100
+// ── SCRUBBER — pointer capture (works on mouse AND touch, no snap-to-start) ──
+scrubInput.addEventListener('pointerdown', (e) => {
+  seeking = true;
+  scrubInput.setPointerCapture(e.pointerId);
+  // Update visuals immediately on click
+  const pct = scrubInput.value / 100;
   setBar(pct);
-  if (audio.duration) {
-    timeNow.textContent = fmt((scrubInput.value / 10000) * audio.duration);
-  }
+  if (audio.duration) timeNow.textContent = fmt((scrubInput.value / 10000) * audio.duration);
 });
 
-// mouseup: seek audio then re-enable updates
-function commitSeek() {
+scrubInput.addEventListener('pointermove', (e) => {
   if (!seeking) return;
-  const targetTime = (scrubInput.value / 10000) * (audio.duration || 0);
+  const pct = scrubInput.value / 100;
+  setBar(pct);
+  if (audio.duration) timeNow.textContent = fmt((scrubInput.value / 10000) * audio.duration);
+});
+
+scrubInput.addEventListener('pointerup', () => {
+  if (!seeking) return;
   if (audio.duration) {
-    audio.currentTime = targetTime;
-    lastTime = targetTime;
+    const t = (scrubInput.value / 10000) * audio.duration;
+    audio.currentTime = t;
+    lastTime = t;
   }
-  // Wait for seeked event before unfreezing — no setTimeout guessing
-  audio.addEventListener('seeked', function onSeeked() {
-    audio.removeEventListener('seeked', onSeeked);
-    seeking = false;
-  }, { once: true });
-  // Fallback in case seeked never fires (e.g. stream not loaded yet)
-  setTimeout(() => { seeking = false; }, 500);
-}
-scrubInput.addEventListener('mouseup',  commitSeek);
-scrubInput.addEventListener('touchend', commitSeek);
-document.addEventListener('mouseup', () => { if (seeking) commitSeek(); });
+  const unlock = () => { seeking = false; };
+  audio.addEventListener('seeked', unlock, { once: true });
+  setTimeout(unlock, 600);
+});
+
+scrubInput.addEventListener('input', () => {
+  if (!seeking) return;
+  const pct = scrubInput.value / 100;
+  setBar(pct);
+  if (audio.duration) timeNow.textContent = fmt((scrubInput.value / 10000) * audio.duration);
+});
 
 // ── CONTROLS ──
 playBtn.addEventListener('click', () => {
-  if (!currentSong) return;
-  if (audio.paused) {
-    // If src is empty or errored, reload from last known position
-    if (!audio.src || audio.error) {
-      resumeFromTime(lastTime);
-    } else {
-      audio.play().catch(() => resumeFromTime(lastTime));
-    }
-  } else {
-    audio.pause();
-  }
+  if (!currentSong && !cachedSrc) return;
+  audio.paused ? audio.play().catch(() => {}) : audio.pause();
 });
 
 document.getElementById('nextBtn').addEventListener('click', nextSong);
@@ -590,12 +578,10 @@ function updateHeart() {
   if (!currentSong) return;
   heartBtn.classList.toggle('active-btn', likedSongs.some(x => x.id === currentSong.id));
 }
-
 heartBtn.addEventListener('click', () => {
   if (!currentSong) return;
   toggleLikeById(currentSong.id);
 });
-
 function toggleLikeById(id) {
   const exists = likedSongs.some(x => x.id === id);
   if (exists) {
@@ -608,26 +594,23 @@ function toggleLikeById(id) {
   }
   saveLiked();
   updateHeart();
-  // update like buttons in all lists
   document.querySelectorAll('.like-btn[data-id="' + id + '"]').forEach(btn => {
     btn.classList.toggle('liked', !exists);
   });
-  // re-render liked view if open
   if (document.getElementById('view-liked').classList.contains('active')) renderLiked();
 }
 
-// ── LIKED / HISTORY VIEWS ──
+// ── LIKED / HISTORY ──
 function renderLiked() {
   loadLiked();
   const el = document.getElementById('likedList');
   el.innerHTML = '';
   if (!likedSongs.length) {
-    el.innerHTML = '<div class="empty-state"><i class="fas fa-heart"></i>No liked songs yet.<br>Tap the heart while playing.</div>';
+    el.innerHTML = '<div class="empty-state"><i class="fas fa-heart"></i>No liked songs yet.</div>';
     return;
   }
   likedSongs.forEach((s, i) => el.appendChild(buildCard(s, i, 'liked')));
 }
-
 function renderHistory() {
   loadHistory();
   const el = document.getElementById('historyList');
@@ -646,42 +629,49 @@ async function renderDownloads() {
   try {
     const res  = await fetch('/api/cached-files');
     const data = await res.json();
-    el.innerHTML = '';
     if (data.error) {
-      el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-circle"></i>Error: ' + escHtml(data.error) + '</div>';
+      el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-circle"></i>' + escHtml(data.error) + '</div>';
       return;
     }
+    el.innerHTML = '';
     if (!data.files || !data.files.length) {
       el.innerHTML = '<div class="empty-state"><i class="fas fa-download"></i>No cached files yet.<br>Download a song from the player.</div>';
       return;
     }
-    // Load saved title map from localStorage
     const titleMap = lsGet('mf_dl_titles', {});
     data.files.forEach(f => {
-      // strip video_id prefix and extension for display, fallback to stored title
       const stem = f.name.replace(/\.[^.]+$/, '');
-      const displayName = titleMap[stem] || f.name;
+      const displayName = titleMap[stem] || stem;
+      const isActive = cachedSrc && cachedSrc.includes(encodeURIComponent(f.name));
       const row = document.createElement('div');
-      row.className = 'dl-file-row';
+      row.className = 'dl-file-row' + (isActive ? ' playing' : '');
       row.innerHTML =
         '<div class="dl-file-icon"><i class="fas fa-music"></i></div>' +
         '<div class="dl-file-info">' +
           '<div class="dl-file-name">' + escHtml(displayName) + '</div>' +
           '<div class="dl-file-meta">' + escHtml(f.name) + ' &middot; ' + fmtSize(f.size) + '</div>' +
         '</div>' +
-        '<a class="dl-save-link" href="/cache/' + encodeURIComponent(f.name) +
-          '" download="' + escHtml(f.name) + '"><i class="fas fa-download"></i> Save</a>';
+        '<div style="display:flex;gap:6px;flex-shrink:0">' +
+          '<button class="dl-play-btn icon-btn" data-file="' + escHtml(f.name) + '" data-title="' + escHtml(displayName) + '" title="Play from cache">' +
+            '<i class="fas fa-play"></i>' +
+          '</button>' +
+          '<a class="dl-save-link" href="/cache/' + encodeURIComponent(f.name) +
+            '" download="' + escHtml(f.name) + '"><i class="fas fa-download"></i></a>' +
+        '</div>';
       el.appendChild(row);
     });
+    // Wire play buttons
+    el.querySelectorAll('.dl-play-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        playFromCache(btn.dataset.file, btn.dataset.title);
+        el.querySelectorAll('.dl-file-row').forEach(r => r.classList.remove('playing'));
+        btn.closest('.dl-file-row').classList.add('playing');
+        btn.innerHTML = '<i class="fas fa-pause"></i>';
+      });
+    });
   } catch(e) {
-    el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-circle"></i>Could not load files.<br><small>' + escHtml(String(e)) + '</small></div>';
+    el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-circle"></i>Could not load: ' + escHtml(String(e)) + '</div>';
   }
-}
-
-function fmtSize(bytes) {
-  if (!bytes) return '';
-  if (bytes > 1024*1024) return (bytes/1024/1024).toFixed(1) + ' MB';
-  return (bytes/1024).toFixed(0) + ' KB';
 }
 
 // ── DOWNLOAD CURRENT ──
@@ -699,31 +689,32 @@ dlBtn.addEventListener('click', async () => {
       dlStatus.innerHTML = '<i class="fas fa-file-audio"></i> ' +
         '<a href="/cache/' + encodeURIComponent(data.filename) +
         '" download="' + escHtml(data.filename) + '">Save file to device</a>';
-      // Store title mapping so downloads view shows song name
-      if (currentSong) {
-        const stem = data.filename.replace(/\.[^.]+$/, '');
-        const titles = lsGet('mf_dl_titles', {});
-        titles[stem] = currentSong.title + ' — ' + currentSong.artist;
-        lsSet('mf_dl_titles', titles);
-      }
-    } else { throw new Error(data.message || 'Unknown error'); }
+      const stem = data.filename.replace(/\.[^.]+$/, '');
+      const titles = lsGet('mf_dl_titles', {});
+      titles[stem] = currentSong.title + ' — ' + currentSong.artist;
+      lsSet('mf_dl_titles', titles);
+    } else { throw new Error(data.message || 'failed'); }
   } catch(err) {
-    dlBtn.disabled  = false;
-    dlBtn.className = 'dl-btn';
-    dlBtn.innerHTML = '<i class="fas fa-download"></i> Download to cache';
-    // If file actually exists despite error, show success anyway
+    // Check if file actually exists despite the error
     fetch('/api/cached-files').then(r => r.json()).then(d => {
       const match = d.files && d.files.find(f => f.name.startsWith(currentSong.id));
       if (match) {
         dlBtn.className = 'dl-btn done';
         dlBtn.innerHTML = '<i class="fas fa-check"></i> Cached!';
-        dlStatus.innerHTML = '<i class="fas fa-file-audio"></i> <a href="/cache/' +
-          encodeURIComponent(match.name) + '" download="' + escHtml(match.name) + '">Save file to device</a>';
+        dlStatus.innerHTML = '<i class="fas fa-file-audio"></i> ' +
+          '<a href="/cache/' + encodeURIComponent(match.name) +
+          '" download="' + escHtml(match.name) + '">Save file to device</a>';
       } else {
+        dlBtn.disabled = false;
+        dlBtn.className = 'dl-btn';
+        dlBtn.innerHTML = '<i class="fas fa-download"></i> Download to cache';
         dlStatus.textContent = '✗ ' + (err.message || 'Download failed');
         setTimeout(() => { dlStatus.textContent = ''; }, 5000);
       }
     }).catch(() => {
+      dlBtn.disabled = false;
+      dlBtn.className = 'dl-btn';
+      dlBtn.innerHTML = '<i class="fas fa-download"></i> Download to cache';
       dlStatus.textContent = '✗ ' + (err.message || 'Download failed');
       setTimeout(() => { dlStatus.textContent = ''; }, 5000);
     });
@@ -734,7 +725,6 @@ dlBtn.addEventListener('click', async () => {
 (function() {
   const btn    = document.getElementById('thumbToggleBtn');
   const banner = document.getElementById('hiddenBanner');
-  const hidden = localStorage.getItem('mf_hide_thumbs') === '1';
   function applyThumbState(hide) {
     document.body.classList.toggle('no-thumbs', hide);
     btn.classList.toggle('active', hide);
@@ -744,7 +734,7 @@ dlBtn.addEventListener('click', async () => {
     banner.classList.toggle('show', hide);
     localStorage.setItem('mf_hide_thumbs', hide ? '1' : '0');
   }
-  applyThumbState(hidden);
+  applyThumbState(localStorage.getItem('mf_hide_thumbs') === '1');
   btn.addEventListener('click', () => {
     applyThumbState(!document.body.classList.contains('no-thumbs'));
   });
@@ -772,6 +762,7 @@ async function loadLyrics(title, artist, duration) {
     lyricsBox.textContent = 'Lyrics not available.';
   }
 }
+
 </script>
 </body>
 </html>
