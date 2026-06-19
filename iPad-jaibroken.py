@@ -1,29 +1,23 @@
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, send_from_directory
 import sqlite3
+import bcrypt
 import yt_dlp
-import re
 import os
-import hashlib
+import re
 
 app = Flask(__name__)
 app.secret_key = "supersecretkey123"
 
-song_cache = {}
 DOWNLOAD_FOLDER = "downloads"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# ===================== AUTH (iPad SAFE) =====================
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
-
-def check_password(password: str, stored: str) -> bool:
-    return hash_password(password) == stored
+song_cache = {}
 
 # ===================== DB =====================
 def init_db():
-    conn = sqlite3.connect("database.db")
+    conn = sqlite3.connect('database.db')
     c = conn.cursor()
-    c.execute("""
+    c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             username TEXT UNIQUE,
@@ -31,31 +25,25 @@ def init_db():
             email TEXT UNIQUE,
             password TEXT
         )
-    """)
+    ''')
     conn.commit()
     conn.close()
 
 init_db()
 
-# ===================== ROUTES =====================
-@app.route("/")
-def home():
-    if "user" in session:
-        return redirect(url_for("music"))
-    return redirect(url_for("login"))
-
-@app.route("/register", methods=["GET", "POST"])
+# ===================== AUTH =====================
+@app.route('/register', methods=['GET', 'POST'])
 def register():
-    if request.method == "POST":
-        username = request.form["username"]
-        name = request.form["name"]
-        email = request.form["email"]
-        password = request.form["password"]
+    if request.method == 'POST':
+        username = request.form['username']
+        name = request.form['name']
+        email = request.form['email']
+        password = request.form['password']
 
-        hashed = hash_password(password)
+        hashed = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
         try:
-            conn = sqlite3.connect("database.db")
+            conn = sqlite3.connect('database.db')
             c = conn.cursor()
             c.execute(
                 "INSERT INTO users (username, name, email, password) VALUES (?, ?, ?, ?)",
@@ -63,52 +51,57 @@ def register():
             )
             conn.commit()
             conn.close()
-            return redirect(url_for("login"))
+            return redirect(url_for('login'))
 
         except Exception:
-            return render_template("register.html", error="User already exists")
+            return render_template('register.html', error="Username or email already exists.")
 
-    return render_template("register.html")
+    return render_template('register.html')
 
 
-@app.route("/login", methods=["GET", "POST"])
+@app.route('/login', methods=['GET', 'POST'])
 def login():
-    if request.method == "POST":
-        username = request.form["username"]
-        password = request.form["password"]
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
 
-        conn = sqlite3.connect("database.db")
+        conn = sqlite3.connect('database.db')
         c = conn.cursor()
         c.execute("SELECT password FROM users WHERE username = ?", (username,))
         result = c.fetchone()
         conn.close()
 
-        if result and check_password(password, result[0]):
-            session["user"] = username
-            return redirect(url_for("music"))
+        if result and bcrypt.checkpw(password.encode('utf-8'), result[0]):
+            session['user'] = username
+            return redirect(url_for('music'))
 
-        return render_template("login.html", error="Invalid login")
+        return render_template('login.html', error="Invalid username or password.")
 
-    return render_template("login.html")
+    return render_template('login.html')
 
 
-@app.route("/logout")
+@app.route('/logout')
 def logout():
-    session.pop("user", None)
-    return redirect(url_for("login"))
+    session.pop('user', None)
+    return redirect(url_for('login'))
 
 
-@app.route("/music")
+@app.route('/')
+def home():
+    return redirect(url_for('music') if 'user' in session else url_for('login'))
+
+
+@app.route('/music')
 def music():
-    if "user" not in session:
-        return redirect(url_for("login"))
-    return render_template("index.html", username=session["user"])
+    if 'user' not in session:
+        return redirect(url_for('login'))
+    return render_template('index.html', username=session['user'])
 
 
 # ===================== SEARCH =====================
-@app.route("/api/search")
+@app.route('/api/search')
 def search_songs():
-    query = request.args.get("q", "").strip()
+    query = request.args.get('q', '').strip()
 
     if len(query) < 2:
         return jsonify([])
@@ -117,9 +110,9 @@ def search_songs():
         return jsonify(song_cache[query])
 
     ydl_opts = {
-        "quiet": True,
-        "extract_flat": True,
-        "default_search": "ytsearch10"
+        'quiet': True,
+        'extract_flat': True,
+        'default_search': 'ytsearch10'
     }
 
     try:
@@ -127,43 +120,33 @@ def search_songs():
             info = ydl.extract_info(f"ytsearch10:{query}", download=False)
 
         results = []
-
-        for entry in info.get("entries", []):
+        for entry in info.get('entries', []):
             if not entry:
                 continue
 
-            vid = entry.get("id")
-            if not vid:
-                continue
-
             results.append({
-                "id": vid,
-                "title": entry.get("title", "Unknown"),
+                "id": entry.get("id"),
+                "title": entry.get("title"),
                 "artist": entry.get("uploader", "Unknown"),
                 "duration": entry.get("duration", 0),
-                "thumbnail": f"https://img.youtube.com/vi/{vid}/hqdefault.jpg"
+                "thumbnail": f"https://img.youtube.com/vi/{entry.get('id')}/hqdefault.jpg"
             })
 
         song_cache[query] = results
         return jsonify(results)
 
-    except Exception:
+    except Exception as e:
         return jsonify([])
 
 
-# ===================== STREAM (FIXED - NO LOOP / NO PROXY) =====================
-@app.route("/api/stream/<video_id>")
+# ===================== STREAM (FIXED) =====================
+@app.route('/api/stream/<video_id>')
 def stream_audio(video_id):
     try:
         ydl_opts = {
-            "format": "bestaudio/best",
-            "quiet": True,
-            "noplaylist": True,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "web"]
-                }
-            }
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'noplaylist': True,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -172,68 +155,52 @@ def stream_audio(video_id):
                 download=False
             )
 
-        audio_url = None
-
-        for f in info.get("formats", []):
-            if f.get("url") and f.get("acodec") != "none":
-                audio_url = f["url"]
+        audio_url = info.get('url')
 
         if not audio_url:
-            return jsonify({"error": "No audio stream found"}), 500
+            return "No audio URL found", 500
 
-        # 👉 IMPORTANT: return URL directly (fixes looping + buffering issues)
-        return jsonify({
-            "url": audio_url
-        })
+        # 🔥 FIX: no proxying, just redirect
+        return redirect(audio_url)
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return str(e), 500
 
 
 # ===================== DOWNLOAD =====================
-@app.route("/api/download/<video_id>")
+@app.route('/api/download/<video_id>')
 def download(video_id):
     try:
-        before = set(os.listdir(DOWNLOAD_FOLDER))
-
         ydl_opts = {
-            "format": "bestaudio/best",
-            "quiet": True,
-            "outtmpl": f"{DOWNLOAD_FOLDER}/{video_id}.%(ext)s",
-            "noplaylist": True,
+            'format': 'bestaudio/best',
+            'outtmpl': f'{DOWNLOAD_FOLDER}/{video_id}.%(ext)s',
+            'noplaylist': True,
+            'quiet': True,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://youtube.com/watch?v={video_id}", download=True)
-
-        after = set(os.listdir(DOWNLOAD_FOLDER))
-        new_files = list(after - before)
-
-        saved = new_files[0] if new_files else None
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}",
+                download=True
+            )
 
         return jsonify({
             "status": "success",
-            "file": saved,
-            "title": info.get("title", "unknown")
+            "title": info.get("title"),
+            "video_id": video_id
         })
 
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
 
-# ===================== CACHE =====================
-@app.route("/cache/<filename>")
-def cache_file(filename):
-    return send_from_directory(DOWNLOAD_FOLDER, filename)
-
-
-@app.route("/api/cached-files")
+# ===================== CACHE FILES =====================
+@app.route('/api/cached-files')
 def cached_files():
-    if "user" not in session:
-        return jsonify({"files": []})
+    if 'user' not in session:
+        return jsonify({'files': []})
 
     files = []
-
     for f in os.listdir(DOWNLOAD_FOLDER):
         path = os.path.join(DOWNLOAD_FOLDER, f)
         if os.path.isfile(path):
@@ -245,6 +212,11 @@ def cached_files():
     return jsonify({"files": files})
 
 
+@app.route('/cache/<filename>')
+def cache(filename):
+    return send_from_directory(DOWNLOAD_FOLDER, filename)
+
+
 # ===================== RUN =====================
-if __name__ == "__main__":
+if __name__ == '__main__':
     app.run(debug=True)
