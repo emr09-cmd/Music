@@ -18,7 +18,7 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build image
-        run: docker build -t emr09/MeloFree:latest .
+        run: docker build -t emr09/melofree:latest .
 
       - name: Push image
-        run: docker push emr09/MeloFree:latest
+        run: docker push emr09/melofree:latest
