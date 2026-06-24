@@ -1,0 +1,50 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Git
+.git/
+.gitignore
+
+# SQLite database files (optional: include if you don't want DB copied)
+*.db
+*.sqlite
+*.sqlite3
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# IDE / editor folders
+.vscode/
+.idea/
+
+# Test/cache folders
+.pytest_cache/
+.mypy_cache/
+
+# Node (if ever added frontend later)
+node_modules/
+
+# Build outputs
+dist/
+build/
+
+# Temporary files
+tmp/
+temp/
+
+# Downloads (yt-dlp output folder if you use one)
+downloads/
+music/
+output/

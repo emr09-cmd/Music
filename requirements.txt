@@ -1,0 +1,5 @@
+Flask
+bcrypt
+requests
+yt-dlp
+requests
